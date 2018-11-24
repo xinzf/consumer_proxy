@@ -11,12 +11,11 @@ import (
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
-	"time"
 )
 
 var (
-	node        *registry.Node
-	Registry    *registry.Consul
+	node     *registry.Node
+	Registry *registry.Consul
 )
 
 func Init(ctx context.Context) {
