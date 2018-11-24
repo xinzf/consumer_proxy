@@ -59,7 +59,7 @@ func ExampleConsumer_Start() {
 		Consumer:  "hdhafd",
 		WorkerNum: 4,
 		TargetUrl: "http://127.0.0.1:8082/index.php",
-		RetryNum:  2,
+		RetryNum:  3,
 		Log: struct {
 			Path    string
 			Maxsize int

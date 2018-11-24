@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
+	"math/rand"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,7 +20,16 @@ type ConsumerOptions struct {
 		Name    string
 		Durable bool
 	}
+	RetryQueue struct {
+		Name    string
+		Durable bool
+	}
 	Exchange struct {
+		Name    string
+		Etype   string
+		Durable bool
+	}
+	RetryExchange struct {
 		Name    string
 		Etype   string
 		Durable bool
@@ -83,8 +94,15 @@ func NewConsumer(options ConsumerOptions) (*Consumer, error) {
 	}
 
 	if options.RetryNum == 0 {
-		options.RetryNum = 1
+		options.RetryNum = 3
 	}
+
+	options.RetryQueue.Name = options.Queue.Name + "@retry"
+	options.RetryQueue.Durable = options.Queue.Durable
+
+	options.RetryExchange.Name = options.Exchange.Name + "@retry"
+	options.RetryExchange.Durable = options.Exchange.Durable
+	options.RetryExchange.Etype = "direct"
 
 	return &Consumer{
 		name:          options.Name,
@@ -235,6 +253,22 @@ func (this *Consumer) preparStart() (msg <-chan amqp.Delivery, err error) {
 		return
 	}
 
+	_, err = this.channel.QueueDeclare(
+		this.options.RetryQueue.Name,
+		this.options.RetryQueue.Durable,
+		false,
+		false,
+		false,
+		amqp.Table{
+			"x-dead-letter-exchange":    this.options.RetryExchange.Name,
+			"x-dead-letter-routing-key": this.options.BindKey,
+		},
+	)
+
+	if err != nil {
+		return
+	}
+
 	// 创建路由
 	err = this.channel.ExchangeDeclare(
 		this.options.Exchange.Name,
@@ -249,11 +283,34 @@ func (this *Consumer) preparStart() (msg <-chan amqp.Delivery, err error) {
 		return
 	}
 
+	// 创建死信路由
+	err = this.channel.ExchangeDeclare(
+		this.options.RetryExchange.Name,
+		this.options.RetryExchange.Etype,
+		this.options.RetryExchange.Durable,
+		false,
+		false,
+		false,
+		nil,
+	)
+
 	// 绑定队列到路由
 	err = this.channel.QueueBind(
 		this.options.Queue.Name,
 		this.options.BindKey,
 		this.options.Exchange.Name,
+		false,
+		nil,
+	)
+	if err != nil {
+		return
+	}
+
+	// 绑定队列到死信路由
+	err = this.channel.QueueBind(
+		this.options.Queue.Name,
+		this.options.BindKey,
+		this.options.RetryExchange.Name,
 		false,
 		nil,
 	)
@@ -300,7 +357,6 @@ func (this *Consumer) preparStart() (msg <-chan amqp.Delivery, err error) {
 }
 
 func (this *Consumer) do(msg amqp.Delivery, i int) {
-	worker := this.workerPool.Get().(*Worker)
 	defer func() {
 		if err := recover(); err != nil {
 			switch err.(type) {
@@ -313,43 +369,72 @@ func (this *Consumer) do(msg amqp.Delivery, i int) {
 		// ack
 		msg.Ack(false)
 
-		// worker 对象放回对象池
-		this.workerPool.Put(worker)
-
 		// 放回令牌
 		this.workerBucket <- i
 	}()
 
-	worker.SetBody(msg)
-	if err := worker.Do(); err != nil {
-
-		logrus.Errorln(err)
-		// @todo 从 redis 中获取 messageid 的失败次数，
-		// @todo 如果失败次数已经大于等于 retryNum，则写入数据库
-		// @todo 否则，通过死信的方式做延迟队列，并 incre 失败次数
-
-		this.channel.Publish(
-			"",
-			this.options.Queue.Name,
-			false,
-			false,
-			amqp.Publishing{
-				Headers:         msg.Headers,
-				ContentType:     msg.ContentType,
-				ContentEncoding: msg.ContentEncoding,
-				DeliveryMode:    msg.DeliveryMode,
-				//Priority:msg.Priority
-				CorrelationId: msg.CorrelationId,
-				ReplyTo:       msg.ReplyTo,
-				Expiration:    msg.Expiration,
-				MessageId:     msg.MessageId,
-				Timestamp:     time.Now(),
-				Type:          msg.Type,
-				UserId:        msg.UserId,
-				AppId:         msg.AppId,
-				Body:          msg.Body,
-			},
-		)
+	if this.getRetryTimes(msg) >= this.options.RetryNum {
+		logrus.Info("重试次数已经达到")
+		// @todo 写数据库
+		return
 	}
 
+	worker := this.workerPool.Get().(*Worker)
+	// worker 对象放回对象池
+	defer this.workerPool.Put(worker)
+
+	worker.SetBody(msg)
+	if err := worker.Do(); err != nil {
+		logrus.Errorln(err)
+		if er := this.retry(msg); er != nil {
+			// @todo 写数据库
+		}
+	}
+}
+
+func (this *Consumer) getRetryTimes(delivery amqp.Delivery) int {
+	var (
+		data  interface{}
+		found bool
+		times int
+	)
+
+	if data, found = delivery.Headers["times"]; found {
+		str := data.(string)
+		times, _ = strconv.Atoi(str)
+
+	}
+	return times
+}
+
+func (this *Consumer) retry(msg amqp.Delivery) error {
+	// @todo 写死了 20~30秒随机
+	second := rand.Intn(10) + 20
+
+	times := this.getRetryTimes(msg) + 1
+	msg.Headers["times"] = strconv.Itoa(times)
+	err := this.channel.Publish(
+		"",
+		this.options.RetryQueue.Name,
+		false,
+		false,
+		amqp.Publishing{
+			Headers:         msg.Headers,
+			ContentType:     msg.ContentType,
+			ContentEncoding: msg.ContentEncoding,
+			DeliveryMode:    msg.DeliveryMode,
+			CorrelationId:   msg.CorrelationId,
+			ReplyTo:         msg.ReplyTo,
+			Expiration:      strconv.Itoa(second * 1000),
+			MessageId:       msg.MessageId,
+			Timestamp:       time.Now(),
+			Type:            msg.Type,
+			UserId:          msg.UserId,
+			AppId:           msg.AppId,
+			Body:            msg.Body,
+		},
+	)
+
+	logrus.Errorln(err)
+	return nil
 }

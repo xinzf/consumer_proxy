@@ -50,7 +50,7 @@ RETRY:
 		case <-this.ctx.Done():
 			this.close()
 		case err, flag := <-this.conn.NotifyClose(notify):
-			atomic.StoreInt32(&this.status, 0)
+			atomic.StoreInt32(&this.status, int32(STOPPED))
 
 			for _, fn := range this.afterClosed {
 				fn(this)
